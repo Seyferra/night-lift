@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black"/>
+<meta name="apple-mobile-web-app-title" content="Night Lift"/>
+<meta name="theme-color" content="#07080c"/>
+<title>NIGHT LIFT</title>
+<link rel="manifest" href="manifest.json"/>
+<link rel="apple-touch-icon" href="icon.svg"/>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none}
+html,body{margin:0;height:100%;background:#07080c;color:#e8d9b0;font-family:ui-monospace,Menlo,Consolas,monospace;overflow:hidden;touch-action:none}
+#app{height:100dvh;height:100svh;display:flex;flex-direction:column;padding-top:env(safe-area-inset-top);padding-bottom:env(safe-area-inset-bottom)}
+#hud{display:flex;justify-content:space-between;align-items:center;padding:6px 12px;font-size:12px;letter-spacing:.08em}
+#stage{flex:1;position:relative;min-height:0}
+canvas{width:100%;height:100%;display:block;background:#0b0d12}
+#pads{height:170px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;padding:8px 10px 10px;background:#0a0c12}
+.col{display:flex;flex-direction:column;gap:8px;align-items:center;justify-content:center}
+.btn{width:72px;height:56px;border:1px solid #3a4560;border-radius:12px;background:#161b28;color:#d7c79a;font:700 13px/1 ui-monospace,Menlo,monospace;display:flex;align-items:center;justify-content:center}
+.btn.on{background:#2a3550;border-color:#d4b46a;color:#fff}
+.wide{width:84px}
+#toast{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;pointer-events:none}
+#toast h1{margin:0 0 8px;font-size:28px;letter-spacing:.18em}
+#toast p{margin:6px 0;opacity:.85;font-size:13px;max-width:280px}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="hud"><span id="score">000000</span><span id="files">FILES 0/4</span><span id="lives">♥♥♥</span></div>
+  <div id="stage"><canvas id="c"></canvas><div id="toast"></div></div>
+  <div id="pads">
+    <div class="col">
+      <div class="btn" data-k="up">UP</div>
+      <div style="display:flex;gap:8px">
+        <div class="btn" data-k="left">◀</div>
+        <div class="btn" data-k="right">▶</div>
+      </div>
+      <div class="btn" data-k="down">DOWN</div>
+    </div>
+    <div class="col"><div class="btn wide" data-k="jump">JUMP</div></div>
+    <div class="col"><div class="btn wide" data-k="fire">FIRE</div></div>
+  </div>
+</div>
+<script>
+(() => {
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const toast = document.getElementById("toast");
+const keys = {left:0,right:0,up:0,down:0,jump:0,fire:0};
+const W = 390, H = 520;
+const FLOOR_H = 70, TOP = 10, PW = 16, PH = 28;
+let dpr = 1, state = "title", score = 0, lives = 3, building = 1;
+let player, lifts, doors, enemies, bullets, sparks, camY, invuln, tFire, tJump;
+
+function floorY(f){ return (TOP - f) * FLOOR_H + 40; }
+function pad(n){ return String(Math.max(0,n|0)).padStart(6,"0"); }
+function hud(){
+  document.getElementById("score").textContent = pad(score);
+  const need = doors.filter(d=>d.red).length;
+  const got = doors.filter(d=>d.red && d.taken).length;
+  document.getElementById("files").textContent = "FILES "+got+"/"+need;
+  document.getElementById("lives").textContent = "♥".repeat(Math.max(0,lives)) || "—";
+}
+function show(html){ toast.innerHTML = html; }
+
+function bindPad(){
+  const set = (k,v) => { if(k in keys) keys[k]=v; };
+  document.querySelectorAll(".btn").forEach(btn=>{
+    const k = btn.dataset.k;
+    const on = e => { e.preventDefault(); set(k,1); btn.classList.add("on"); };
+    const off = e => { e.preventDefault(); set(k,0); btn.classList.remove("on"); };
+    btn.addEventListener("pointerdown", on);
+    btn.addEventListener("pointerup", off);
+    btn.addEventListener("pointercancel", off);
+    btn.addEventListener("pointerleave", off);
+  });
+  window.addEventListener("keydown", e=>{
+    if(e.code==="ArrowLeft") keys.left=1;
+    if(e.code==="ArrowRight") keys.right=1;
+    if(e.code==="ArrowUp") keys.up=1;
+    if(e.code==="ArrowDown") keys.down=1;
+    if(e.code==="KeyZ") keys.fire=1;
+    if(e.code==="KeyX"||e.code==="Space") keys.jump=1;
+    if(e.code==="Enter" && state!=="play") start();
+  });
+  window.addEventListener("keyup", e=>{
+    if(e.code==="ArrowLeft") keys.left=0;
+    if(e.code==="ArrowRight") keys.right=0;
+    if(e.code==="ArrowUp") keys.up=0;
+    if(e.code==="ArrowDown") keys.down=0;
+    if(e.code==="KeyZ") keys.fire=0;
+    if(e.code==="KeyX"||e.code==="Space") keys.jump=0;
+  });
+  canvas.addEventListener("pointerdown", () => { if(state!=="play") start(); });
+}
+
+function resize(){
+  const r = canvas.getBoundingClientRect();
+  dpr = Math.min(2, window.devicePixelRatio||1);
+  canvas.width = Math.max(1, r.width*dpr);
+  canvas.height = Math.max(1, r.height*dpr);
+}
+
+function newBuilding(){
+  lifts = [
+    {x:195,w:34,min:5,max:10,f:10,v:0,held:0},
+    {x:78,w:34,min:1,max:6,f:3,v:0,held:0},
+    {x:312,w:34,min:0,max:5,f:1,v:0,held:0}
+  ];
+  doors = [
+    {x:28,f:9,red:1,taken:0},{x:338,f:8,red:1,taken:0},
+    {x:28,f:6,red:1,taken:0},{x:338,f:4,red:1,taken:0},
+    {x:338,f:9,red:0},{x:28,f:7,red:0},{x:338,f:5,red:0},{x:28,f:3,red:0}
+  ];
+  enemies = [];
+  bullets = [];
+  sparks = [];
+  spawnWave();
+}
+function spawnWave(){
+  const spots = [{x:40,f:8},{x:350,f:7},{x:40,f:5},{x:350,f:3},{x:40,f:2}];
+  spots.forEach((s,i)=>{
+    if(i < 2+building) enemies.push({x:s.x,f:s.f,vx: i%2?40:-40, alive:1, cd: 0.6+i*0.2});
+  });
+}
+function resetPlayer(){
+  player = {x:195,f:10,y:floorY(10),vy:0,face:1,duck:0,inLift:-1,alive:1};
+  invuln = 1.2; tFire = 0; tJump = 0;
+  camY = player.y - 220;
+}
+function start(){
+  if(state==="gameover"){ score=0; lives=3; building=1; }
+  if(state==="win"){ building++; }
+  newBuilding();
+  resetPlayer();
+  state = "play";
+  show("");
+  hud();
+}
+function allFiles(){ return doors.filter(d=>d.red).every(d=>d.taken); }
+
+liftAt = (x,f) => {
+  for(let i=0;i<lifts.length;i++){
+    const L=lifts[i];
+    if(Math.abs(x-L.x)<L.w*0.55 && Math.abs(f-L.f)<0.18 && f>=L.min-0.05 && f<=L.max+0.05) return i;
+  }
+  return -1;
+};
+function inShaft(x, L){ return Math.abs(x-L.x) < L.w*0.48; }
+
+function killPlayer(){
+  if(invuln>0 || !player.alive) return;
+  lives--;
+  hud();
+  if(lives<=0){
+    state="gameover";
+    show("<h1>NIGHT LIFT</h1><p>Mission failed.</p><p>Tap to try building "+building+" again</p>");
+    return;
+  }
+  resetPlayer();
+}
+function killEnemy(e){
+  if(!e.alive) return;
+  e.alive=0; score+=100; hud();
+}
+
+function shoot(from, face, friend){
+  if(bullets.filter(b=>b.friend===friend).length>=3) return;
+  bullets.push({x:from.x+face*12,y:floorY(from.f)- (from.duck?10:18), vx:face*220, friend, life:1.2});
+}
+
+function update(dt){
+  if(state!=="play") return;
+  invuln = Math.max(0, invuln-dt);
+  tFire = Math.max(0, tFire-dt);
+  tJump = Math.max(0, tJump-dt);
+  player.duck = keys.down && player.inLift<0 && Math.abs(player.vy)<8 ? 1 : 0;
+
+  // lifts auto / player
+  lifts.forEach((L,i)=>{
+    L.held = player.inLift===i;
+    if(L.held){
+      if(keys.up) L.v = 2.2;
+      else if(keys.down) L.v = -2.2;
+      else L.v = 0;
+    } else {
+      if(Math.abs(L.v)<0.05){
+        // idle drift slowly toward a random stop
+        if(Math.random()<0.003) L.v = Math.random()<0.5?0.7:-0.7;
+      }
+    }
+    L.f += L.v * dt;
+    if(L.f > L.max){ L.f=L.max; L.v=0; }
+    if(L.f < L.min){ L.f=L.min; L.v=0; }
+    if(!L.held && Math.abs(L.f-Math.round(L.f))<0.02){ L.f=Math.round(L.f); L.v*=0.4; }
+    enemies.forEach(e=>{
+      if(e.alive && inShaft(e.x,L) && e.f>L.f && e.f<L.f+0.35 && L.v< -0.3){ killEnemy(e); score+=200; }
+    });
+  });
+
+  // board / ride
+  if(player.inLift>=0){
+    const L = lifts[player.inLift];
+    player.f = L.f;
+    player.y = floorY(player.f);
+    player.vy = 0;
+    if(keys.left) { player.x -= 90*dt; player.face=-1; }
+    if(keys.right){ player.x += 90*dt; player.face=1; }
+    if(Math.abs(player.x-L.x)>L.w*0.58 && Math.abs(L.f-Math.round(L.f))<0.12){
+      player.inLift=-1;
+      player.f=Math.round(L.f);
+      player.y=floorY(player.f);
+    }
+  } else {
+    if(keys.left) { player.x -= 110*dt; player.face=-1; }
+    if(keys.right){ player.x += 110*dt; player.face=1; }
+    // jump
+    if(keys.jump && tJump===0 && Math.abs(player.vy)<4){
+      player.vy = -240; tJump = 0.35;
+      enemies.forEach(e=>{
+        if(e.alive && Math.abs(e.x-player.x)<18 && Math.abs(e.f-player.f)<0.2){ killEnemy(e); score+=50; }
+      });
+    }
+    player.vy += 720*dt;
+    player.y += player.vy*dt;
+    // floor snap unless in open shaft
+    const fApprox = Math.max(0, Math.min(TOP, TOP - (player.y-40)/FLOOR_H));
+    const fl = Math.round(fApprox*2)/2;
+    const open = lifts.some(L => inShaft(player.x,L) && Math.abs(L.f-Math.round(player.y && 0))>-1 && !(Math.abs(L.f - Math.round(TOP-(player.y-40)/FLOOR_H))<0.2) && player.y+2 < floorY(Math.floor(TOP-(player.y-40)/FLOOR_H))+2);
+    // simpler floor collision
+    const nearF = Math.round(TOP - (player.y-40)/FLOOR_H);
+    const fy = floorY(nearF);
+    const shaftOpen = lifts.some(L => inShaft(player.x,L) && Math.abs(L.f-nearF)>0.2);
+    if(player.vy>=0 && player.y >= fy && !shaftOpen){
+      player.y = fy; player.vy=0; player.f=nearF;
+    } else if(shaftOpen && player.vy>=0){
+      const idx = liftAt(player.x, TOP - (player.y-40)/FLOOR_H);
+      if(idx>=0){ player.inLift=idx; player.f=lifts[idx].f; player.y=floorY(player.f); player.vy=0; }
+      else if(player.y > floorY(0)+20){ killPlayer(); }
+    }
+    const board = liftAt(player.x, player.f);
+    if(board>=0 && (keys.up||keys.down||Math.abs(player.x-lifts[board].x)<10)) player.inLift = board;
+  }
+  player.x = Math.max(18, Math.min(372, player.x));
+
+  // doors
+  if(keys.up && player.inLift<0){
+    doors.forEach(d=>{
+      if(d.red && !d.taken && Math.abs(player.x-d.x)<22 && Math.abs(player.f-d.f)<0.2){
+        d.taken=1; score+=500; hud();
+      }
+    });
+  }
+
+  // fire
+  if(keys.fire && tFire===0){ shoot(player, player.face, 1); tFire=0.22; }
+
+  // enemies
+  enemies.forEach(e=>{
+    if(!e.alive) return;
+    e.x += e.vx*dt;
+    if(e.x<24 || e.x>366) e.vx*=-1;
+    if(Math.abs(e.f-player.f)<0.25 && Math.abs(e.x-player.x)>20){
+      e.vx = Math.sign(player.x-e.x)*46;
+      e.cd -= dt;
+      if(e.cd<=0){ shoot(e, Math.sign(player.x-e.x)||1, 0); e.cd = 1.1 + Math.random()*0.6; }
+    }
+    if(invuln<=0 && Math.abs(e.x-player.x)<14 && Math.abs(e.f-player.f)<0.2) killPlayer();
+  });
+
+  // bullets
+  bullets.forEach(b=>{
+    b.x += b.vx*dt; b.life-=dt;
+    if(b.friend){
+      enemies.forEach(e=>{ if(e.alive && Math.abs(e.x-b.x)<12 && Math.abs(floorY(e.f)-18-b.y)<16){ killEnemy(e); b.life=0; } });
+    } else if(invuln<=0 && Math.abs(player.x-b.x)<12 && Math.abs((floorY(player.f)-(player.duck?10:18))-b.y)<14){
+      killPlayer(); b.life=0;
+    }
+  });
+  bullets = bullets.filter(b=>b.life>0 && b.x>0 && b.x<390);
+
+  // escape
+  if(allFiles() && player.f<=0.15 && player.x>150 && player.x<240){
+    score += 1000*building;
+    state="win";
+    show("<h1>CLEAR</h1><p>Building "+building+" escaped.</p><p>Tap for the next tower</p>");
+    hud();
+  }
+
+  camY += ((player.y-230)-camY)*Math.min(1,dt*6);
+}
+
+function drawAgent(x,y,face,duck,tint,flash){
+  ctx.save();
+  ctx.translate(x,y);
+  ctx.fillStyle = flash? "#fff" : tint;
+  ctx.fillRect(-7, duck?-16:-PH, 14, duck?16:PH);
+  ctx.fillStyle = "#f0e0c0";
+  ctx.fillRect(-4, duck?-22:-PH-8, 8, 8);
+  ctx.fillStyle = "#d4b46a";
+  ctx.fillRect(face>0?6:-9, duck?-12:-20, 8, 3);
+  ctx.restore();
+}
+function draw(){
+  const sw = canvas.width, sh = canvas.height;
+  ctx.setTransform(dpr * (sw/dpr)/W, 0, 0, dpr * (sh/dpr)/H, 0, 0);
+  // actually map logical W x H onto canvas
+  ctx.setTransform(canvas.width/W, 0, 0, canvas.height/H, 0, 0);
+  ctx.fillStyle="#07080c"; ctx.fillRect(0,0,W,H);
+  ctx.save();
+  ctx.translate(0, -camY + 80);
+
+  // building
+  ctx.fillStyle="#141a28"; ctx.fillRect(8, floorY(TOP)-40, 374, floorY(0)-floorY(TOP)+120);
+  for(let f=0;f<=TOP;f++){
+    const y=floorY(f);
+    ctx.fillStyle="#2a3348"; ctx.fillRect(8,y,374,4);
+    ctx.fillStyle="#6d7b98"; ctx.font="10px monospace";
+    ctx.fillText(f===0?"B":String(f), 14, y-8);
+  }
+  // garage car
+  ctx.fillStyle="#9a2b2b"; ctx.fillRect(158, floorY(0)+8, 74, 22);
+  ctx.fillStyle="#1a1a1a"; ctx.fillRect(166, floorY(0)+24, 12, 8); ctx.fillRect(210, floorY(0)+24, 12, 8);
+  ctx.fillStyle="#d4b46a"; ctx.fillText(allFiles()?"GET IN":"NEED FILES", 160, floorY(0)+48);
+
+  lifts.forEach(L=>{
+    const y=floorY(L.f);
+    ctx.fillStyle="#0a0c12"; ctx.fillRect(L.x-L.w/2, floorY(L.max)-36, L.w, floorY(L.min)-floorY(L.max)+50);
+    ctx.fillStyle="#c9b37a"; ctx.fillRect(L.x-2, floorY(L.max)-36, 4, floorY(L.min)-floorY(L.max)+20);
+    ctx.fillStyle="#3d4a66"; ctx.fillRect(L.x-L.w/2+2, y-32, L.w-4, 32);
+    ctx.fillStyle="#d4b46a"; ctx.fillRect(L.x-L.w/2+2, y-4, L.w-4, 4);
+  });
+
+  doors.forEach(d=>{
+    const y=floorY(d.f);
+    ctx.fillStyle = d.red ? (d.taken?"#5a2a2a":"#c43c3c") : "#3a4d78";
+    ctx.fillRect(d.x-12, y-36, 24, 36);
+    ctx.fillStyle="#e8d9b0"; ctx.fillRect(d.x+6, y-20, 3, 3);
+  });
+
+  enemies.forEach(e=> e.alive && drawAgent(e.x, floorY(e.f), Math.sign(e.vx)||1, 0, "#8b3a3a", 0));
+  if(player.alive) drawAgent(player.x, player.y, player.face, player.duck, "#1e3a5f", invuln>0 && ((invuln*20)|0)%2);
+  bullets.forEach(b=>{ ctx.fillStyle=b.friend?"#f4e2a8":"#ff6b6b"; ctx.fillRect(b.x-3,b.y-2,6,3); });
+
+  ctx.restore();
+  if(state==="title"){
+    ctx.setTransform(canvas.width/W,0,0,canvas.height/H,0,0);
+  }
+}
+
+function loop(now){
+  if(!loop.t) loop.t=now;
+  let dt=Math.min(0.033,(now-loop.t)/1000); loop.t=now;
+  update(dt); draw(); requestAnimationFrame(loop);
+}
+
+function title(){
+  state="title";
+  show("<h1>NIGHT LIFT</h1><p>Steal every crimson file. Ride the shafts. Escape the garage.</p><p>Tap to deploy Agent 9</p>");
+  newBuilding(); resetPlayer(); hud();
+}
+
+window.addEventListener("resize", resize);
+bindPad();
+resize();
+title();
+requestAnimationFrame(loop);
+if("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js");
+})();
+</script>
+</body>
+</html>
